@@ -1,11 +1,11 @@
-# USV Autonomous Collision Avoidance — TD3 Reproduction
+# USV Autonomous Collision Avoidance — TD3 & ATL-TD3 Reproduction
 
-Reproduction of the **TD3 baseline** from:
+Reproduction of both the **TD3 baseline** and the **ATL-TD3 proposed method** from:
 
-> Cui et al., "Autonomous collision avoidance decision-making method for USV based on ATL-TD3 algorithm",  
-> *Ocean Engineering* 312 (2024) 119297.
+> Cui et al., "Autonomous collision avoidance decision-making method for USV based on ATL-TD3 algorithm"  
+> *Ocean Engineering* 312 (2024) 119297
 
-This code implements the standard TD3 algorithm (without LSTM / multi-head attention) and tests it on all **20 Imazu classic encounter scenarios**.
+Tested on all **20 Imazu classic encounter scenarios**.
 
 ---
 
@@ -14,14 +14,14 @@ This code implements the standard TD3 algorithm (without LSTM / multi-head atten
 ```
 usv_td3/
 ├── ship_model.py       # 3-DOF nonlinear USV dynamics (Fossen 2011, Table 1)
-├── colregs_model.py    # Ship domain (QSD), arena model, COLREGs classifier, radar sensor
-├── environment.py      # RL environment — state/action/reward (Eq.19-25)
-├── td3_agent.py        # TD3 algorithm — Actor, Critic, ReplayBuffer
-├── imazu_scenarios.py  # All 20 Imazu case definitions (Fig.9)
-├── train.py            # Training loop
-├── evaluate.py         # Evaluation + trajectory/rudder plots
-├── requirements.txt
-└── README.md
+├── colregs_model.py    # QSD ship domain, arena model, COLREGs classifier, 48-beam radar
+├── environment.py      # RL environment — reward function (Eq.19-25), state/action spaces
+├── td3_agent.py        # Standard TD3 — Actor/Critic FC networks + ReplayBuffer
+├── atl_td3_agent.py    # ATL-TD3 — MHA-LSTM networks + SequenceReplayBuffer + EpisodeWindow
+├── imazu_scenarios.py  # All 20 Imazu case definitions
+├── train.py            # Unified training script (--algo td3 | atl_td3)
+├── evaluate.py         # Evaluation + trajectory/rudder plots + comparison mode
+└── requirements.txt
 ```
 
 ---
@@ -32,78 +32,112 @@ usv_td3/
 pip install -r requirements.txt
 ```
 
-Tested with Python 3.8+, PyTorch 1.12+.
+Python 3.8+, PyTorch 1.12+.
 
 ---
 
-## Quick Start
-
-### 1. Train
+## Training
 
 ```bash
-# Standard training (5000 episodes, ~30-60 min on CPU, ~10 min on GPU)
-python train.py
+# Train standard TD3
+python train.py --algo td3 --episodes 5000
 
-# With wind/wave disturbance
-python train.py --wind-wave
+# Train ATL-TD3 (proposed method)
+python train.py --algo atl_td3 --episodes 5000
 
-# Custom episode count and save directory
-python train.py --episodes 3000 --save-dir ./my_checkpoints
+# With wind/wave disturbance (paper: 45° dir, H_s=0.15m, T_p=5.5s)
+python train.py --algo atl_td3 --wind-wave
 
 # Resume from checkpoint
-python train.py --resume checkpoints/best_model.pt --episodes 2000
+python train.py --algo atl_td3 --resume checkpoints/atl_td3_best.pt
 ```
 
-Training prints every 50 episodes and evaluates on all 20 Imazu cases every 200 episodes.  
-The **best model** (highest Imazu success rate) is saved to `checkpoints/best_model.pt`.
+Models are saved to `./checkpoints/`:
+- `td3_best.pt` / `td3_final.pt`
+- `atl_td3_best.pt` / `atl_td3_final.pt`
+
+Evaluation on 20 Imazu cases runs every 200 episodes; best-so-far is saved automatically.
 
 ---
 
-### 2. Evaluate
+## Evaluation
 
 ```bash
-# Evaluate all 20 Imazu cases and plot trajectories
-python evaluate.py --model checkpoints/best_model.pt
+# Evaluate TD3 on all 20 cases
+python evaluate.py --algo td3 --model checkpoints/td3_best.pt
 
-# Single case with detailed plot
-python evaluate.py --model checkpoints/best_model.pt --case 11
+# Evaluate ATL-TD3 on all 20 cases + save figures
+python evaluate.py --algo atl_td3 --model checkpoints/atl_td3_best.pt --save-fig
 
-# Save figures to PNG
-python evaluate.py --model checkpoints/best_model.pt --save-fig
+# Single case detail plot
+python evaluate.py --algo atl_td3 --model checkpoints/atl_td3_best.pt --case 11
+
+# Side-by-side comparison on one case
+python evaluate.py --compare \
+    --td3-model    checkpoints/td3_best.pt \
+    --atltd3-model checkpoints/atl_td3_best.pt \
+    --case 11 --save-fig
 ```
 
-Output plots match the style of **Fig.9** (trajectories) and **Fig.10** (rudder angles) in the paper.
+Output figures reproduce **Fig.9** (trajectories) and **Fig.10** (rudder angles) of the paper.
 
 ---
 
-## Key Parameters (from Table 1 of the paper)
+## ATL-TD3 Architecture (Section 3.1, Fig.5–7)
 
-| Parameter | Symbol | Value |
-|-----------|--------|-------|
-| Actor learning rate | Ar | 0.0003 |
-| Critic learning rate | Cr | 0.0003 |
-| Discount rate | γ | 0.87 |
-| Safety distance | S₁ | 3.5 n mile |
-| Radar radius | R_radar | 4.5 n mile |
-| Arena radius | R_A | 1.8 n mile |
-| COLREGs weight (a) | λ_c1 | 0.58 |
-| COLREGs weight (b) | λ_c2 | 0.73 |
-| Safety reward weight | λ_s | 0.77 |
-| Immediate danger weight | λ_i | 0.94 |
-| Arrival reward | r_arrival | 1000 |
-| Collision reward | r_collision | −750 |
-| MHA heads | h | 4 (ATL version only) |
+### MHA-LSTM Block
+
+```
+Input sequence (B, T, state_dim)
+        │
+        ▼
+  LSTM (hidden=128)           ← Eq.11-15: input/forget/output gates
+        │
+        ▼ H (B, T, 128)
+  Multi-Head Self-Attention   ← Eq.16-18: 4 heads, causal mask
+  (h=4, embed=128)
+        │
+        ▼ C (B, T, 128)
+  Residual: H + C
+        │
+  take last timestep
+  concat(h_last, c_last)
+        │
+        ▼ (B, 256)
+```
+
+### Actor
+
+```
+MHALSTMBlock(state_dim → 256)
+→ FC(256, ReLU) → FC(256, ReLU) → FC(action_dim, Tanh)
+```
+
+### Critic (×2)
+
+```
+MHALSTMBlock(state_dim → 256)
+concat with action (256+1=257)
+→ FC(256, ReLU) → FC(256, ReLU) → FC(1)
+```
 
 ---
 
-## State and Action Space
+## Key Parameters (Table 1)
 
-- **State** (52-dim, Eq.19):  
-  `[x_o, y_o, x_g, y_g, χ₁, χ₂, ..., χ₄₈]`  
-  — normalized OS position, goal position, and 48 radar detection beam readings.
-
-- **Action** (1-dim):  
-  Continuous rudder angle in `[-20°, 20°]`, output from Actor as `[-1, 1]` scaled by 20.
+| Parameter | Value |
+|-----------|-------|
+| Actor / Critic LR | 0.0003 |
+| Discount γ | 0.87 |
+| MHA heads h | **4** |
+| LSTM hidden | 128 (→ 256 after concat) |
+| FC hidden | 256 |
+| Sequence window T | 8 steps |
+| Safety distance S₁ | 3.5 n mile |
+| Radar radius | 4.5 n mile |
+| Arena radius R_A | 1.8 n mile |
+| Arrival reward | +1000 |
+| Collision reward | −750 |
 
 ---
 
@@ -113,79 +147,41 @@ Output plots match the style of **Fig.9** (trajectories) and **Fig.10** (rudder 
 R = R_g + R_s + R_c + R_i + R_a
 ```
 
-| Component | Role |
-|-----------|------|
-| R_g | Guidance — penalise distance to goal |
-| R_s | Safety — penalise proximity to target ships |
-| R_c | COLREGs — reward compliant manoeuvres |
+| Term | Description |
+|------|-------------|
+| R_g | Guidance — penalise Euclidean distance to goal |
+| R_s | Safety — exponential penalty when TS enters radar range |
+| R_c | COLREGs — reward/penalise compliance with clauses 13–17 |
 | R_i | Immediate danger — override COLREGs when ship domain violated |
 | R_a | Terminal — +1000 arrival, −750 collision |
 
 ---
 
-## Imazu Test Cases
+## State & Action Space (Eq.19)
 
-| Cases | Type |
-|-------|------|
-| 1–4   | Two-ship: head-on, overtaking, crossing (GW/SO) |
-| 5–10  | Three-ship: mixed encounters |
-| 11–20 | Four-ship (three TS): complex multi-ship situations |
+- **State** (52-dim): `[x_o, y_o, x_g, y_g, χ₁ … χ₄₈]`
+  - Normalised OS position, goal position, 48 radar beam readings
+  - ATL-TD3 feeds a **window of T=8 consecutive states** to the LSTM
 
----
-
-## Expected Results
-
-The paper reports that the **standard TD3** (without ATL enhancement):
-- Passes most of the simpler cases (1–10).
-- Shows **high collision risk in cases 11–20** (complex multi-ship).
-- Exhibits longer navigation paths and rougher trajectories vs ATL-TD3.
-
-This is consistent with Fig.11 and Fig.13 of the paper, where TD3 achieves ~75–80% success rate  
-versus ATL-TD3's near-100% success.
-
-**To improve success rate** on cases 11–20, consider:
-1. Increasing training episodes to 8000–10000.
-2. Increasing replay buffer size (default 1e5).
-3. Tuning exploration noise downward after 3000 episodes.
-4. Using prioritised experience replay.
+- **Action** (1-dim): rudder angle ∈ [−20°, 20°], output as [−1, 1]×20
 
 ---
 
-## Tuning Guide
+## Expected Performance
 
-If the agent fails too many cases, try adjusting in `train.py`:
+| Algorithm | Cases 1–10 | Cases 11–20 | Overall |
+|-----------|-----------|------------|---------|
+| TD3       | ~90%      | ~60–70%    | ~75%    |
+| ATL-TD3   | ~100%     | ~90–100%   | ~95%+   |
 
-```python
-EXPLORE_NOISE  = 0.10     # reduce from 0.15 for more stable late training
-WARMUP_STEPS   = 2000     # more random exploration at start
-BATCH_SIZE     = 512      # larger batches for stability
-```
-
-And in `td3_agent.py`:
-
-```python
-discount = 0.90    # slightly higher discount for long-horizon tasks
-tau      = 0.003   # slower target network update
-```
+The paper reports ATL-TD3 convergence speed enhanced by **47%, 36%, 28%** over TD3  
+in 2-, 3-, and 4-USV training environments respectively (Section 4.2).
 
 ---
 
-## Notes on Coordinate System
+## Coordinate System
 
 - World frame: `x = East`, `y = North` (math convention).
 - Headings: radians, `0 = East`, CCW positive.  
-  Use `heading_to_math(compass_deg)` from `imazu_scenarios.py` to convert.
-- All distances in **nautical miles (n mile)**.
-- Time step: `dt = 1.0 s`.
-
----
-
-## Differences from Paper's ATL-TD3
-
-This code reproduces only the **TD3 baseline**. The ATL-TD3 adds:
-1. LSTM layer between input and hidden layers (retains historical state).
-2. Multi-head self-attention (MHA, 4 heads) on top of LSTM output.
-3. Optimised experience replay (Section 3.1 of paper).
-
-To implement ATL-TD3, replace the `Actor` and `Critic` networks in `td3_agent.py`  
-with LSTM+MHA variants, keeping all other training logic identical.
+  Convert compass headings via `heading_to_math(deg)` in `imazu_scenarios.py`.
+- Distances in **nautical miles (n mile)**, time step `dt = 1.0 s`.
