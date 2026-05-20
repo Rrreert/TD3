@@ -325,8 +325,14 @@ class ATLTD3:
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_opt    = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
-        # AMP scaler
-        self.scaler = torch.cuda.amp.GradScaler() if self.amp else None
+        # AMP scalers — one per optimizer so each has independent state
+        # Use the new torch.amp API (torch.cuda.amp is deprecated in PyTorch 2.x)
+        if self.amp:
+            self.scaler_critic = torch.amp.GradScaler('cuda')
+            self.scaler_actor  = torch.amp.GradScaler('cuda')
+        else:
+            self.scaler_critic = None
+            self.scaler_actor  = None
 
         # Pre-allocate a reusable GPU inference tensor (1, T, S)
         self._infer_buf = torch.zeros(
@@ -365,14 +371,17 @@ class ATLTD3:
 
         # ── Critic update ──
         if self.amp:
-            with torch.cuda.amp.autocast():
-                loss_c, target_Q = self._critic_loss(
+            # Correct AMP flow: scale → backward → unscale → clip → step → update
+            # Each optimizer has its own scaler so state machines never interfere
+            with torch.amp.autocast('cuda'):
+                loss_c, _ = self._critic_loss(
                     state_seq, action, next_seq, reward, done)
             self.critic_opt.zero_grad(set_to_none=True)
-            self.scaler.scale(loss_c).backward()
-            self.scaler.unscale_(self.critic_opt)
+            self.scaler_critic.scale(loss_c).backward()
+            self.scaler_critic.unscale_(self.critic_opt)
             nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-            self.scaler.step(self.critic_opt)
+            self.scaler_critic.step(self.critic_opt)
+            self.scaler_critic.update()
         else:
             loss_c, _ = self._critic_loss(
                 state_seq, action, next_seq, reward, done)
@@ -385,17 +394,17 @@ class ATLTD3:
         actor_loss_val = None
         if self.total_it % self.policy_delay == 0:
             if self.amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     loss_a = -self.critic.Q1(
                         state_seq,
                         self.actor.forward_single(state_seq)
                     ).mean()
                 self.actor_opt.zero_grad(set_to_none=True)
-                self.scaler.scale(loss_a).backward()
-                self.scaler.unscale_(self.actor_opt)
+                self.scaler_actor.scale(loss_a).backward()
+                self.scaler_actor.unscale_(self.actor_opt)
                 nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-                self.scaler.step(self.actor_opt)
-                self.scaler.update()
+                self.scaler_actor.step(self.actor_opt)
+                self.scaler_actor.update()
             else:
                 loss_a = -self.critic.Q1(
                     state_seq,
